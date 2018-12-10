@@ -14,6 +14,7 @@
  * @brief       Netdev interface for the ESP-NOW WiFi P2P protocol
  *
  * @author      Gunar Schorcht <gunar@schorcht.net>
+ * @author      Timo Rothenpieler <timo.rothenpieler@uni-bremen.de>
  */
 
 #define ENABLE_DEBUG (0)
@@ -25,7 +26,6 @@
 #include <assert.h>
 #include <errno.h>
 
-#include "net/gnrc/netif/raw.h"
 #include "net/gnrc.h"
 #include "xtimer.h"
 
@@ -36,14 +36,12 @@
 #include "esp_system.h"
 #include "esp_wifi.h"
 #include "irq_arch.h"
+#include "od.h"
 
 #include "nvs_flash/include/nvs_flash.h"
 
 #include "esp_now_params.h"
 #include "esp_now_netdev.h"
-
-#include "net/ipv6/hdr.h"
-#include "net/gnrc/ipv6/nib.h"
 
 #define ESP_NOW_UNICAST          1
 
@@ -60,28 +58,8 @@
  * not provide an argument that could be used as pointer to the ESP-NOW
  * device which triggers the interrupt.
  */
-static esp_now_netdev_t _esp_now_dev;
+static esp_now_netdev_t _esp_now_dev = { 0 };
 static const netdev_driver_t _esp_now_driver;
-
-/* device thread stack */
-static char _esp_now_stack[ESP_NOW_STACKSIZE];
-
-static inline int _get_mac_from_iid(uint8_t *iid, uint8_t *mac)
-{
-    CHECK_PARAM_RET (iid != NULL, -EINVAL);
-    CHECK_PARAM_RET (mac != NULL, -EINVAL);
-
-    /* interface id according to */
-    /* https://tools.ietf.org/html/rfc4291#section-2.5.1 */
-    mac[0] = iid[0] ^ 0x02; /* invert bit1 */
-    mac[1] = iid[1];
-    mac[2] = iid[2];
-    mac[3] = iid[5];
-    mac[4] = iid[6];
-    mac[5] = iid[7];
-
-    return 0;
-}
 
 #if ESP_NOW_UNICAST
 static xtimer_t _esp_now_scan_peers_timer;
@@ -236,7 +214,7 @@ static IRAM_ATTR void esp_now_recv_cb(const uint8_t *mac, const uint8_t *data, i
     }
 #endif
 
-    if (_esp_now_dev.rx_len) {
+    if (_esp_now_dev.rx_pkt.len) {
         /* there is already a packet in receive buffer, we drop the new one */
         return;
     }
@@ -244,16 +222,16 @@ static IRAM_ATTR void esp_now_recv_cb(const uint8_t *mac, const uint8_t *data, i
     critical_enter();
 
 #if 0 /* don't printf anything in ISR */
-    printf ("%s\n", __func__);
-    printf ("%s: received %d byte from %02x:%02x:%02x:%02x:%02x:%02x\n",
-            __func__, len,
-            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-    esp_hexdump (data, len, 'b', 16);
+    printf("%s\n", __func__);
+    printf("%s: received %d byte from %02x:%02x:%02x:%02x:%02x:%02x\n",
+           __func__, len,
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    od_hex_dump(data, len, OD_WIDTH_DEFAULT);
 #endif
 
-    _esp_now_dev.rx_len = len;
-    memcpy(_esp_now_dev.rx_buf, data, len);
-    memcpy(_esp_now_dev.rx_mac, mac, ESP_NOW_ADDR_LEN);
+    memcpy(&_esp_now_dev.rx_pkt, data, len);
+    memcpy(_esp_now_dev.rx_pkt.mac, mac, ESP_NOW_ADDR_LEN);
+    _esp_now_dev.rx_pkt.len = len;
 
     if (_esp_now_dev.netdev.event_callback) {
         _esp_now_dev.netdev.event_callback((netdev_t*)&_esp_now_dev, NETDEV_EVENT_ISR);
@@ -322,9 +300,16 @@ static esp_err_t IRAM_ATTR _esp_system_event_handler(void *ctx, system_event_t *
 extern esp_err_t esp_system_event_add_handler(system_event_cb_t handler,
                                               void *arg);
 
-static void esp_now_setup(esp_now_netdev_t* dev)
+esp_now_netdev_t *netdev_esp_now_setup(void)
 {
+    esp_now_netdev_t* dev = &_esp_now_dev;
+
     DEBUG("%s: %p\n", __func__, dev);
+
+    if (dev->netdev.driver) {
+        DEBUG("%s: early returning previously initialized device\n", __func__);
+        return dev;
+    }
 
     /*
      * Init the WiFi driver. TODO It is not only required before ESP_NOW is
@@ -342,7 +327,7 @@ static void esp_now_setup(esp_now_netdev_t* dev)
     if (result != ESP_OK) {
         LOG_TAG_ERROR("esp_now",
                       "nfs_flash_init failed with return value %d\n", result);
-        return;
+        return NULL;
     }
 #endif
 
@@ -351,7 +336,7 @@ static void esp_now_setup(esp_now_netdev_t* dev)
     if (result != ESP_OK) {
         LOG_TAG_ERROR("esp_now",
                       "esp_wifi_init failed with return value %d\n", result);
-        return;
+        return NULL;
     }
 
 #ifdef CONFIG_WIFI_COUNTRY
@@ -396,7 +381,7 @@ static void esp_now_setup(esp_now_netdev_t* dev)
         LOG_TAG_ERROR("esp_now",
                       "esp_wifi_set_mode failed with return value %d\n",
                       result);
-        return;
+        return NULL;
     }
 
     /* set the Station and SoftAP configuration */
@@ -404,14 +389,14 @@ static void esp_now_setup(esp_now_netdev_t* dev)
     if (result != ESP_OK) {
         LOG_TAG_ERROR("esp_now", "esp_wifi_set_config station failed with "
                       "return value %d\n", result);
-        return;
+        return NULL;
     }
     result = esp_wifi_set_config(ESP_IF_WIFI_AP, &wifi_config_ap);
     if (result != ESP_OK) {
         LOG_TAG_ERROR("esp_now",
                       "esp_wifi_set_mode softap failed with return value %d\n",
                       result);
-        return;
+        return NULL;
     }
 
     /* start the WiFi driver */
@@ -419,7 +404,7 @@ static void esp_now_setup(esp_now_netdev_t* dev)
     if (result != ESP_OK) {
         LOG_TAG_ERROR("esp_now",
                       "esp_wifi_start failed with return value %d\n", result);
-        return;
+        return NULL;
     }
 
 #if ESP_NOW_UNICAST==0 /* TODO */
@@ -440,7 +425,7 @@ static void esp_now_setup(esp_now_netdev_t* dev)
     if (result != ESP_OK) {
         LOG_TAG_ERROR("esp_now", "esp_now_init failed with return value %d\n",
                       result);
-        return;
+        return NULL;
     }
     esp_now_register_send_cb(esp_now_send_cb);
     esp_now_register_recv_cb(esp_now_recv_cb);
@@ -470,6 +455,8 @@ static void esp_now_setup(esp_now_netdev_t* dev)
     DEBUG("%s: multicast node added %d\n", __func__, res);
 #endif
 #endif /* ESP_NOW_UNICAST */
+
+    return dev;
 }
 
 static int _init(netdev_t *netdev)
@@ -499,155 +486,43 @@ static int _send(netdev_t *netdev, const iolist_t *iolist)
     esp_now_netdev_t* dev = (esp_now_netdev_t*)netdev;
 
     mutex_lock(&dev->dev_lock);
-    dev->tx_len = 0;
 
-    /* load packet data into TX buffer */
-    for (const iolist_t *iol = iolist; iol; iol = iol->iol_next) {
-        if (dev->tx_len + iol->iol_len > ESP_NOW_MAX_SIZE) {
-            mutex_unlock(&dev->dev_lock);
-            return -EOVERFLOW;
-        }
-        memcpy (dev->tx_buf + dev->tx_len, iol->iol_base, iol->iol_len);
-        dev->tx_len += iol->iol_len;
-    }
+    esp_now_pkt_t *tx_pkt = iolist->iol_base;
 
-#if ENABLE_DEBUG
-    printf("%s: send %d byte\n", __func__, dev->tx_len);
-    /* esp_hexdump(dev->tx_buf, dev->tx_len, 'b', 16); */
+    DEBUG("%s: send %d byte\n", __func__, tx_pkt->len);
+#if defined(MODULE_OD) && ENABLE_DEBUG
+    od_hex_dump(&tx_pkt->buf, tx_pkt->len, OD_WIDTH_DEFAULT);
 #endif
 
     _esp_now_sending = 1;
 
-    uint8_t* _esp_now_dst = 0;
+    uint8_t* _esp_now_dst = NULL;
 
-    #if ESP_NOW_UNICAST
-    ipv6_hdr_t* ipv6_hdr = (ipv6_hdr_t*)dev->tx_buf;
-    uint8_t  _esp_now_dst_from_iid[6];
-
-    if (ipv6_hdr->dst.u8[0] == 0xff) {
-        /* packets to multicast prefix ff::/8 are sent to all peers */
-        DEBUG("multicast to all peers\n");
-        _esp_now_dst = 0;
-        _esp_now_sending = dev->peers_all;
-
-        #ifdef MODULE_NETSTATS_L2
-        netdev->stats.tx_mcast_count++;
-        #endif
-    }
-
-    else if ((byteorder_ntohs(ipv6_hdr->dst.u16[0]) & 0xffc0) == 0xfe80) {
-        /* for link local addresses fe80::/10, the MAC address is derived from dst address */
-        _get_mac_from_iid(&ipv6_hdr->dst.u8[8], _esp_now_dst_from_iid);
-        DEBUG("link local to %02x:%02x:%02x:%02x:%02x:%02x\n",
-              _esp_now_dst_from_iid[0], _esp_now_dst_from_iid[1],
-              _esp_now_dst_from_iid[2], _esp_now_dst_from_iid[3],
-              _esp_now_dst_from_iid[4], _esp_now_dst_from_iid[5]);
-        _esp_now_dst = _esp_now_dst_from_iid;
-        _esp_now_sending = 1;
-    }
-
-    else {
-        #ifdef MODULE_GNRC_IPV6_NIB
-        /* for other addresses, try to find an entry in NIB cache */
-        gnrc_ipv6_nib_nc_t nce;
-        int ret = gnrc_ipv6_nib_get_next_hop_l2addr (&ipv6_hdr->dst, dev->netif,
-                                                     NULL, &nce);
-        if (ret == 0) {
-            /* entry was found in NIB, use MAC adress from the NIB cache entry */
-            DEBUG("global, next hop to neighbor %02x:%02x:%02x:%02x:%02x:%02x\n",
-                  nce.l2addr[0], nce.l2addr[1], nce.l2addr[2],
-                  nce.l2addr[3], nce.l2addr[4], nce.l2addr[5]);
-            _esp_now_dst = nce.l2addr;
-            _esp_now_sending = 1;
-        }
-        else {
-        #endif
-            /* entry was not found in NIB, send to all peers */
-            DEBUG("global, no neibhbor found, multicast to all peers\n");
-            _esp_now_dst = 0;
-            _esp_now_sending = dev->peers_all;
-
-            #ifdef MODULE_NETSTATS_L2
-            netdev->stats.tx_mcast_count++;
-            #endif
-
-        #ifdef MODULE_GNRC_IPV6_NIB
-        }
-        #endif
-    }
-
-    #else /* ESP_NOW_UNICAST */
-
-    ipv6_hdr_t* ipv6_hdr = (ipv6_hdr_t*)dev->tx_buf;
-    uint8_t  _esp_now_dst_from_iid[6];
-
-    _esp_now_dst = (uint8_t*)_esp_now_mac;
-    _esp_now_sending = 1;
-
-    if (ipv6_hdr->dst.u8[0] == 0xff) {
-        /* packets to multicast prefix ff::/8 are sent to all peers */
-        DEBUG("multicast to all peers\n");
-
-        #ifdef MODULE_NETSTATS_L2
-        netdev->stats.tx_mcast_count++;
-        #endif
-    }
-
-    else if ((byteorder_ntohs(ipv6_hdr->dst.u16[0]) & 0xffc0) == 0xfe80) {
-        /* for link local addresses fe80::/10, the MAC address is derived from dst address */
-        _get_mac_from_iid(&ipv6_hdr->dst.u8[8], _esp_now_dst_from_iid);
-        DEBUG("link local to %02x:%02x:%02x:%02x:%02x:%02x\n",
-              _esp_now_dst_from_iid[0], _esp_now_dst_from_iid[1],
-              _esp_now_dst_from_iid[2], _esp_now_dst_from_iid[3],
-              _esp_now_dst_from_iid[4], _esp_now_dst_from_iid[5]);
-        if (esp_now_is_peer_exist(_esp_now_dst_from_iid) > 0) {
-            _esp_now_dst = _esp_now_dst_from_iid;
+    for (uint8_t i = 0; i < ESP_NOW_ADDR_LEN; i++) {
+        if (tx_pkt->mac[i] != 0xff) {
+            _esp_now_dst = tx_pkt->mac;
+            break;
         }
     }
 
-    else
-    {
-        /* for other addresses, try to find an entry in NIB cache */
-          gnrc_ipv6_nib_nc_t nce;
-        int ret = gnrc_ipv6_nib_get_next_hop_l2addr (&ipv6_hdr->dst, dev->netif,
-                                                     NULL, &nce);
-        if (ret == 0 && esp_now_is_peer_exist(nce.l2addr) > 0) {
-            /* entry was found in NIB, use MAC adress from the NIB cache entry */
-            DEBUG("global, next hop to neighbor %02x:%02x:%02x:%02x:%02x:%02x\n",
-                  nce.l2addr[0], nce.l2addr[1], nce.l2addr[2],
-                  nce.l2addr[3], nce.l2addr[4], nce.l2addr[5]);
-            _esp_now_dst = nce.l2addr;
-        }
-        else {
-            /* entry was not found in NIB, send to all peers */
-            DEBUG("global, no neibhbor found, multicast to all peers\n");
-
-            #ifdef MODULE_NETSTATS_L2
-            netdev->stats.tx_mcast_count++;
-            #endif
-        }
-    }
-
-    #endif /* ESP_NOW_UNICAST */
-    if (_esp_now_dst) {
-        DEBUG("%s: send to esp_now addr %02x:%02x:%02x:%02x:%02x:%02x\n", __func__,
-              _esp_now_dst[0], _esp_now_dst[1], _esp_now_dst[2],
-              _esp_now_dst[3], _esp_now_dst[4], _esp_now_dst[5]);
-    }
+    DEBUG("%s: send to esp_now addr %02x:%02x:%02x:%02x:%02x:%02x%s\n", __func__,
+          tx_pkt->mac[0], tx_pkt->mac[1], tx_pkt->mac[2],
+          tx_pkt->mac[3], tx_pkt->mac[4], tx_pkt->mac[5],
+          _esp_now_dst ? "" : " (bcast)");
 
     /* send the the packet to the peer(s) mac address */
-    if (esp_now_send (_esp_now_dst, dev->tx_buf, dev->tx_len) == 0) {
+    if (esp_now_send(_esp_now_dst, (uint8_t*)&tx_pkt->buf, tx_pkt->len) == 0) {
         while (_esp_now_sending > 0) {
             thread_yield_higher();
         }
 
 #ifdef MODULE_NETSTATS_L2
-        netdev->stats.tx_bytes += dev->tx_len;
+        netdev->stats.tx_bytes += tx_pkt->len;
         netdev->event_callback(netdev, NETDEV_EVENT_TX_COMPLETE);
 #endif
 
         mutex_unlock(&dev->dev_lock);
-        return dev->tx_len;
+        return tx_pkt->len;
     }
     else {
 #ifdef MODULE_NETSTATS_L2
@@ -669,7 +544,7 @@ static int _recv(netdev_t *netdev, void *buf, size_t len, void *info)
 
     mutex_lock(&dev->dev_lock);
 
-    uint8_t size = dev->rx_len;
+    uint8_t size = dev->rx_pkt.len;
 
     if (!buf && !len) {
         /* return the size without dropping received data */
@@ -679,32 +554,39 @@ static int _recv(netdev_t *netdev, void *buf, size_t len, void *info)
 
     if (!buf && len) {
         /* return the size and drop received data */
+        dev->rx_pkt.len = 0;
         mutex_unlock(&dev->dev_lock);
-        dev->rx_len = 0;
         return size;
     }
 
-    if (buf && len && dev->rx_len) {
-        if (dev->rx_len > len) {
+    if (buf && len && !dev->rx_pkt.len) {
+        mutex_unlock(&dev->dev_lock);
+        return 0;
+    }
+
+    if (buf && len && dev->rx_pkt.len) {
+        if (dev->rx_pkt.len > len) {
             DEBUG("[esp_now] No space in receive buffers\n");
             mutex_unlock(&dev->dev_lock);
             return -ENOBUFS;
         }
 
-#if ENABLE_DEBUG
-        printf ("%s: received %d byte from %02x:%02x:%02x:%02x:%02x:%02x\n",
-                __func__, dev->rx_len,
-                dev->rx_mac[0], dev->rx_mac[1], dev->rx_mac[2],
-                dev->rx_mac[3], dev->rx_mac[4], dev->rx_mac[5]);
-        /* esp_hexdump (dev->rx_buf, dev->rx_len, 'b', 16); */
+        DEBUG("%s: received %d byte from %02x:%02x:%02x:%02x:%02x:%02x\n",
+              __func__, dev->rx_pkt.len,
+              dev->rx_pkt.mac[0], dev->rx_pkt.mac[1], dev->rx_pkt.mac[2],
+              dev->rx_pkt.mac[3], dev->rx_pkt.mac[4], dev->rx_pkt.mac[5]);
+#if defined(MODULE_OD) && ENABLE_DEBUG
+        od_hex_dump(dev->rx_pkt.buf.data, dev->rx_pkt.len, OD_WIDTH_DEFAULT);
 #endif
 
-        if (esp_now_is_peer_exist(dev->rx_mac) <= 0) {
-            _esp_now_add_peer(dev->rx_mac, esp_now_params.channel, esp_now_params.key);
+        if (esp_now_is_peer_exist(dev->rx_pkt.mac) <= 0) {
+            _esp_now_add_peer(dev->rx_pkt.mac, esp_now_params.channel, esp_now_params.key);
         }
 
-        memcpy(buf, dev->rx_buf, dev->rx_len);
-        dev->rx_len = 0;
+        if (buf != &dev->rx_pkt) {
+            memcpy(buf, &dev->rx_pkt, dev->rx_pkt.len);
+            dev->rx_pkt.len = 0;
+        }
 
 #ifdef MODULE_NETSTATS_L2
         netdev->stats.rx_count++;
@@ -854,16 +736,5 @@ static const netdev_driver_t _esp_now_driver =
     .get = _get,
     .set = _set,
 };
-
-void auto_init_esp_now (void)
-{
-    LOG_TAG_INFO("esp_now", "initializing ESP-NOW device\n");
-
-    esp_now_setup(&_esp_now_dev);
-    _esp_now_dev.netif = gnrc_netif_raw_create(_esp_now_stack,
-                                              ESP_NOW_STACKSIZE, ESP_NOW_PRIO,
-                                              "net-esp-now",
-                                              (netdev_t *)&_esp_now_dev);
-}
 
 /** @} */
