@@ -21,6 +21,7 @@
 #define ESP_NOW_NETDEV_H
 
 #include "net/netdev.h"
+#include "ringbuffer.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -47,6 +48,16 @@ extern "C" {
 #define ESP_NOW_MAX_SIZE (ESP_NOW_MAX_SIZE_RAW - ESP_NOW_HEADER_LENGTH)
 
 /**
+ * @brief   buffer size used for RX buffering
+ *
+ * Reduce this value if your expected traffic does not include full IPv6 MTU
+ * sized packets.
+ */
+#ifndef ESP_NOW_BUFSIZE
+#define ESP_NOW_BUFSIZE (1500)
+#endif
+
+/**
  * @brief   Reference to the netdev device driver struct
  */
 extern const netdev_driver_t esp_now_driver;
@@ -60,26 +71,6 @@ typedef struct __attribute__((packed))
 } esp_now_pkt_hdr_t;
 
 /**
- * @brief   Packed ESP-NOW packet buffer
- */
-typedef struct __attribute__((packed))
-{
-    esp_now_pkt_hdr_t hdr; /**< Header */
-    uint8_t data[ESP_NOW_MAX_SIZE]; /**< L3 data */
-} esp_now_pkt_buf_t;
-
-/**
- * @brief   struct holding esp_now packet + metadata
- */
-typedef struct
-{
-    esp_now_pkt_buf_t buf; /**< packet data */
-
-    uint8_t len; /**< number of bytes in buf (including header) */
-    uint8_t mac[ESP_NOW_ADDR_LEN]; /**< l2 packet source/destination address (depending on context) */
-} esp_now_pkt_t;
-
-/**
  * @brief   Device descriptor for ESP-NOW devices
  */
 typedef struct
@@ -88,7 +79,8 @@ typedef struct
 
     uint8_t addr[ESP_NOW_ADDR_LEN];  /**< device addr (MAC address) */
 
-    esp_now_pkt_t rx_pkt;            /**< receive packet */
+    uint8_t rx_mem[ESP_NOW_BUFSIZE];
+    ringbuffer_t rx_buf;
 
     gnrc_netif_t* netif;             /**< reference to the corresponding netif */
 

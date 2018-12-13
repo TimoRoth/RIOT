@@ -17,6 +17,7 @@
  */
 
 #include <assert.h>
+#include <stdlib.h>
 
 #include <sys/uio.h>
 
@@ -26,14 +27,13 @@
 #include "esp_now_netdev.h"
 #include "esp_now_netif.h"
 #include "net/gnrc/netif.h"
-#include "od.h"
 
 #define ENABLE_DEBUG    (0)
 #include "debug.h"
 
 static int _send(gnrc_netif_t *netif, gnrc_pktsnip_t *pkt)
 {
-    esp_now_pkt_t esp_now_pkt;
+    uint8_t mac[ESP_NOW_ADDR_LEN];
     netdev_t *dev = netif->dev;
 
     assert(pkt != NULL);
@@ -53,62 +53,82 @@ static int _send(gnrc_netif_t *netif, gnrc_pktsnip_t *pkt)
 
     if (netif_hdr->flags & (GNRC_NETIF_HDR_FLAGS_BROADCAST | GNRC_NETIF_HDR_FLAGS_MULTICAST)) {
         /* ESP-NOW does not support multicast, always broadcast */
-        memset(esp_now_pkt.mac, 0xff, ESP_NOW_ADDR_LEN);
+        memset(mac, 0xff, ESP_NOW_ADDR_LEN);
     } else if (netif_hdr->dst_l2addr_len == ESP_NOW_ADDR_LEN) {
-        memcpy(esp_now_pkt.mac, gnrc_netif_hdr_get_dst_addr(netif_hdr), ESP_NOW_ADDR_LEN);
+        memcpy(mac, gnrc_netif_hdr_get_dst_addr(netif_hdr), ESP_NOW_ADDR_LEN);
     } else {
         DEBUG("gnrc_esp_now: destination address had unexpected format"
               "(flags=%d, dst_l2addr_len=%d)\n", netif_hdr->flags, netif_hdr->dst_l2addr_len);
+        gnrc_pktbuf_release(pkt);
         return -EBADMSG;
+    }
+
+    iolist_t payload_iolist = {
+        .iol_base = calloc(1, sizeof(esp_now_pkt_hdr_t)),
+        .iol_len = sizeof(esp_now_pkt_hdr_t)
+    };
+
+    iolist_t iolist = {
+        .iol_base = mac,
+        .iol_len = sizeof(mac),
+        .iol_next = &payload_iolist
+    };
+
+    esp_now_pkt_hdr_t *esp_hdr = payload_iolist.iol_base;
+
+    if (!esp_hdr) {
+        DEBUG("gnrc_esp_now: no memory to allocate payload buffer\n");
+        gnrc_pktbuf_release(pkt);
+        return -ENOMEM;
     }
 
     switch (payload->type) {
 #ifdef MODULE_GNRC_SIXLOWPAN
         case GNRC_NETTYPE_SIXLOWPAN:
-            esp_now_pkt.buf.hdr.flags = 1;
+            esp_hdr->flags = 1;
             break;
 #endif
         default:
-            esp_now_pkt.buf.hdr.flags = 0;
+            esp_hdr->flags = 0;
     }
 
-    iolist_t iolist = {
-        .iol_base = (char*)&esp_now_pkt,
-        .iol_len = sizeof(esp_now_pkt_t)
-    };
-
-    unsigned payload_len = 0;
-    uint8_t *pos = esp_now_pkt.buf.data;
-
     while (payload) {
-        payload_len += payload->size;
-
-        if (payload_len > ESP_NOW_MAX_SIZE) {
+        if (payload_iolist.iol_len + payload->size > ESP_NOW_MAX_SIZE) {
             DEBUG("gnrc_esp_now: payload length exceeds maximum(%u>%u)\n",
-                  payload_len, ESP_NOW_MAX_SIZE);
+                  payload_iolist.iol_len, ESP_NOW_MAX_SIZE);
+            free(payload_iolist.iol_base);
             gnrc_pktbuf_release(pkt);
             return -EBADMSG;
         }
 
-        memcpy(pos, payload->data, payload->size);
-        pos += payload->size;
+        payload_iolist.iol_base = realloc(payload_iolist.iol_base,
+                                          payload_iolist.iol_len + payload->size);
+        if (!payload_iolist.iol_base) {
+            DEBUG("gnrc_esp_now: no memory to reallocate payload buffer\n");
+            free(esp_hdr);
+            gnrc_pktbuf_release(pkt);
+            return -ENOMEM;
+        }
+        esp_hdr = payload_iolist.iol_base;
+
+        memcpy(payload_iolist.iol_base + payload_iolist.iol_len,
+               payload->data, payload->size);
+        payload_iolist.iol_len += payload->size;
+
         payload = payload->next;
     }
 
-    /* pkt has been copied into esp_now_pkt, we're done with it. */
+    /* pkt has been copied into payload_iolist, we're done with it. */
     gnrc_pktbuf_release(pkt);
 
-    esp_now_pkt.len = ESP_NOW_HEADER_LENGTH + (uint8_t)payload_len;
-
     DEBUG("gnrc_esp_now: sending packet to %02x:%02x:%02x:%02x:%02x:%02x with size %u\n",
-            esp_now_pkt.mac[0], esp_now_pkt.mac[1], esp_now_pkt.mac[2],
-            esp_now_pkt.mac[3], esp_now_pkt.mac[4], esp_now_pkt.mac[5],
-            (unsigned)payload_len);
-#if defined(MODULE_OD) && ENABLE_DEBUG
-    od_hex_dump(esp_now_pkt.buf.data, payload_len, OD_WIDTH_DEFAULT);
-#endif
+          mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], (unsigned)payload_iolist.iol_len);
 
-    return dev->driver->send(dev, &iolist);
+    int res = dev->driver->send(dev, &iolist);
+
+    free(payload_iolist.iol_base);
+
+    return res;
 }
 
 static gnrc_pktsnip_t *_recv(gnrc_netif_t *netif)
@@ -116,34 +136,68 @@ static gnrc_pktsnip_t *_recv(gnrc_netif_t *netif)
     netdev_t *dev = netif->dev;
     esp_now_netdev_t *esp_now = (esp_now_netdev_t*)dev;
 
-    /*
-     * buf == &esp_now_netdev->rx_pkt is a special case, avoiding a memcpy and 250 bytes
-     * extra stack usage. It leaves the responsibility of resetting rx_pkt.len to 0 to us.
-     */
-    int recv_res = dev->driver->recv(dev, &esp_now->rx_pkt, sizeof(esp_now->rx_pkt), NULL);
-    if (recv_res <= 0) {
-        DEBUG("gnrc_esp_now: failed receiving packet: %d\n", recv_res);
+    int bytes_expected = dev->driver->recv(dev, NULL, 0, NULL);
+    if (bytes_expected <= 0) {
+        DEBUG("gnrc_esp_now: failed receiving packet: %d\n", bytes_expected);
         return NULL;
     }
 
-    int nettype;
-    switch (esp_now->rx_pkt.buf.hdr.flags) {
+    gnrc_pktsnip_t *pkt;
+    pkt = gnrc_pktbuf_add(NULL, NULL,
+                          bytes_expected,
+                          GNRC_NETTYPE_UNDEF);
+    if (!pkt) {
+        DEBUG("gnrc_esp_now: cannot allocate pktsnip.\n");
+
+        /* drop the packet */
+        dev->driver->recv(dev, NULL, bytes_expected, NULL);
+
+        return NULL;
+    }
+
+    int nread = dev->driver->recv(dev, pkt->data, bytes_expected, NULL);
+    if (nread <= 0) {
+        DEBUG("gnrc_esp_now: read error %d\n", nread);
+        goto err;
+    }
+
+    if (nread < bytes_expected) {
+        DEBUG("gnrc_esp_now: reallocating.\n");
+        gnrc_pktbuf_realloc_data(pkt, nread);
+    }
+
+    gnrc_pktsnip_t *mac_hdr;
+    mac_hdr = gnrc_pktbuf_mark(pkt, ESP_NOW_ADDR_LEN, GNRC_NETTYPE_UNDEF);
+    if (!mac_hdr) {
+        DEBUG("gnrc_esp_now: no space left in packet buffer\n");
+        goto err;
+    }
+
+    gnrc_pktsnip_t *esp_hdr;
+    esp_hdr = gnrc_pktbuf_mark(pkt, sizeof(esp_now_pkt_hdr_t), GNRC_NETTYPE_UNDEF);
+    if (!esp_hdr) {
+        DEBUG("gnrc_esp_now: no space left in packet buffer\n");
+        pkt = mac_hdr;
+        goto err;
+    }
+    esp_now_pkt_hdr_t *hdr = (esp_now_pkt_hdr_t*)esp_hdr->data;
+
+#ifdef MODULE_L2FILTER
+    if (!l2filter_pass(dev->filter, mac_hdr->data, ESP_NOW_ADDR_LEN)) {
+        DEBUG("gnrc_esp_now: incoming packet filtered by l2filter\n");
+        pkt = mac_hdr;
+        goto err;
+    }
+#endif
+
+    switch (hdr->flags) {
 #ifdef MODULE_GNRC_SIXLOWPAN
         case 1:
-            nettype = GNRC_NETTYPE_SIXLOWPAN;
+            pkt->type = GNRC_NETTYPE_SIXLOWPAN;
             break;
 #endif
         default:
-            nettype = GNRC_NETTYPE_UNDEF;
-    }
-
-    /* copy packet payload into pktbuf */
-    unsigned pkt_len = esp_now->rx_pkt.len - ESP_NOW_HEADER_LENGTH;
-    gnrc_pktsnip_t *pkt = gnrc_pktbuf_add(NULL, esp_now->rx_pkt.buf.data, pkt_len, nettype);
-
-    if(!pkt) {
-        DEBUG("gnrc_esp_now: _recv: cannot allocate pktsnip.\n");
-        return NULL;
+            pkt->type = GNRC_NETTYPE_UNDEF;
     }
 
     gnrc_pktsnip_t *netif_hdr;
@@ -154,28 +208,29 @@ static gnrc_pktsnip_t *_recv(gnrc_netif_t *netif)
                     GNRC_NETTYPE_NETIF);
     if (!netif_hdr) {
         DEBUG("gnrc_esp_now: no space left in packet buffer\n");
-        gnrc_pktbuf_release(pkt);
-        return NULL;
+        pkt = mac_hdr;
+        goto err;
     }
 
     gnrc_netif_hdr_init(netif_hdr->data, ESP_NOW_ADDR_LEN, ESP_NOW_ADDR_LEN);
-    gnrc_netif_hdr_set_src_addr(netif_hdr->data, esp_now->rx_pkt.mac, ESP_NOW_ADDR_LEN);
+    gnrc_netif_hdr_set_src_addr(netif_hdr->data, mac_hdr->data, ESP_NOW_ADDR_LEN);
     gnrc_netif_hdr_set_dst_addr(netif_hdr->data, esp_now->addr, ESP_NOW_ADDR_LEN);
 
     ((gnrc_netif_hdr_t *)netif_hdr->data)->if_pid = thread_getpid();
 
+    uint8_t *mac = mac_hdr->data;
     DEBUG("gnrc_esp_now: received packet from %02x:%02x:%02x:%02x:%02x:%02x of length %u\n",
-            esp_now->rx_pkt.mac[0], esp_now->rx_pkt.mac[1], esp_now->rx_pkt.mac[2],
-            esp_now->rx_pkt.mac[3], esp_now->rx_pkt.mac[4], esp_now->rx_pkt.mac[5],
-            pkt_len);
-#if defined(MODULE_OD) && ENABLE_DEBUG
-    od_hex_dump(esp_now->rx_pkt.buf.data, pkt_len, OD_WIDTH_DEFAULT);
-#endif
+          mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], pkt->size);
 
-    pkt->next = netif_hdr;
-    esp_now->rx_pkt.len = 0;
+    gnrc_pktbuf_remove_snip(pkt, mac_hdr);
+    gnrc_pktbuf_remove_snip(pkt, esp_hdr);
+    LL_APPEND(pkt, netif_hdr);
 
     return pkt;
+
+err:
+    gnrc_pktbuf_release(pkt);
+    return NULL;
 }
 
 static const gnrc_netif_ops_t _esp_now_ops = {

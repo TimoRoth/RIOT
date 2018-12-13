@@ -214,12 +214,15 @@ static IRAM_ATTR void esp_now_recv_cb(const uint8_t *mac, const uint8_t *data, i
     }
 #endif
 
-    if (_esp_now_dev.rx_pkt.len) {
-        /* there is already a packet in receive buffer, we drop the new one */
+    critical_enter();
+    mutex_lock(&_esp_now_dev.dev_lock);
+
+    if ((int)ringbuffer_get_free(&_esp_now_dev.rx_buf) < 1 + ESP_NOW_ADDR_LEN + len) {
+        mutex_unlock(&_esp_now_dev.dev_lock);
+        critical_exit();
+        DEBUG("%s: buffer full, dropping incoming packet of %d bytes\n", __func__, len);
         return;
     }
-
-    critical_enter();
 
 #if 0 /* don't printf anything in ISR */
     printf("%s\n", __func__);
@@ -229,9 +232,11 @@ static IRAM_ATTR void esp_now_recv_cb(const uint8_t *mac, const uint8_t *data, i
     od_hex_dump(data, len, OD_WIDTH_DEFAULT);
 #endif
 
-    memcpy(&_esp_now_dev.rx_pkt, data, len);
-    memcpy(_esp_now_dev.rx_pkt.mac, mac, ESP_NOW_ADDR_LEN);
-    _esp_now_dev.rx_pkt.len = len;
+    ringbuffer_add_one(&_esp_now_dev.rx_buf, len);
+    ringbuffer_add(&_esp_now_dev.rx_buf, (char*)mac, ESP_NOW_ADDR_LEN);
+    ringbuffer_add(&_esp_now_dev.rx_buf, (char*)data, len);
+
+    mutex_unlock(&_esp_now_dev.dev_lock);
 
     if (_esp_now_dev.netdev.event_callback) {
         _esp_now_dev.netdev.event_callback((netdev_t*)&_esp_now_dev, NETDEV_EVENT_ISR);
@@ -318,6 +323,8 @@ esp_now_netdev_t *netdev_esp_now_setup(void)
      */
     extern portMUX_TYPE g_intr_lock_mux;
     mutex_init(&g_intr_lock_mux);
+
+    ringbuffer_init(&dev->rx_buf, (char*)dev->rx_mem, sizeof(dev->rx_mem));
 
     esp_system_event_add_handler(_esp_system_event_handler, NULL);
 
@@ -481,48 +488,52 @@ static int _send(netdev_t *netdev, const iolist_t *iolist)
     DEBUG("%s: %p %p\n", __func__, netdev, iolist);
 
     CHECK_PARAM_RET(netdev != NULL, -ENODEV);
-    CHECK_PARAM_RET(iolist != NULL, -EINVAL);
+    CHECK_PARAM_RET(iolist != NULL && iolist->iol_len == ESP_NOW_ADDR_LEN, -EINVAL);
+    CHECK_PARAM_RET(iolist->iol_next != NULL, -EINVAL);
 
     esp_now_netdev_t* dev = (esp_now_netdev_t*)netdev;
 
     mutex_lock(&dev->dev_lock);
 
-    esp_now_pkt_t *tx_pkt = iolist->iol_base;
-
-    DEBUG("%s: send %d byte\n", __func__, tx_pkt->len);
-#if defined(MODULE_OD) && ENABLE_DEBUG
-    od_hex_dump(&tx_pkt->buf, tx_pkt->len, OD_WIDTH_DEFAULT);
-#endif
-
-    _esp_now_sending = 1;
-
     uint8_t* _esp_now_dst = NULL;
 
     for (uint8_t i = 0; i < ESP_NOW_ADDR_LEN; i++) {
-        if (tx_pkt->mac[i] != 0xff) {
-            _esp_now_dst = tx_pkt->mac;
+        if (((uint8_t*)iolist->iol_base)[i] != 0xff) {
+            _esp_now_dst = iolist->iol_base;
             break;
         }
     }
 
-    DEBUG("%s: send to esp_now addr %02x:%02x:%02x:%02x:%02x:%02x%s\n", __func__,
-          tx_pkt->mac[0], tx_pkt->mac[1], tx_pkt->mac[2],
-          tx_pkt->mac[3], tx_pkt->mac[4], tx_pkt->mac[5],
-          _esp_now_dst ? "" : " (bcast)");
+    iolist = iolist->iol_next;
 
-    /* send the the packet to the peer(s) mac address */
-    if (esp_now_send(_esp_now_dst, (uint8_t*)&tx_pkt->buf, tx_pkt->len) == 0) {
+    DEBUG("%s: send %u byte\n", __func__, (unsigned)iolist->iol_len);
+#if defined(MODULE_OD) && ENABLE_DEBUG
+    od_hex_dump(iolist->iol_base, iolist->iol_len, OD_WIDTH_DEFAULT);
+#endif
+
+    _esp_now_sending = 1;
+
+    if (_esp_now_dst) {
+        DEBUG("%s: send to esp_now addr %02x:%02x:%02x:%02x:%02x:%02x\n", __func__,
+              _esp_now_dst[0], _esp_now_dst[1], _esp_now_dst[2],
+              _esp_now_dst[3], _esp_now_dst[4], _esp_now_dst[5]);
+    } else {
+        DEBUG("%s: send esp_now broadcast\n", __func__);
+    }
+
+    /* send the packet to the peer(s) mac address */
+    if (esp_now_send(_esp_now_dst, iolist->iol_base, iolist->iol_len) == 0) {
         while (_esp_now_sending > 0) {
             thread_yield_higher();
         }
 
 #ifdef MODULE_NETSTATS_L2
-        netdev->stats.tx_bytes += tx_pkt->len;
+        netdev->stats.tx_bytes += iolist->iol_len;
         netdev->event_callback(netdev, NETDEV_EVENT_TX_COMPLETE);
 #endif
 
         mutex_unlock(&dev->dev_lock);
-        return tx_pkt->len;
+        return iolist->iol_len;
     }
     else {
 #ifdef MODULE_NETSTATS_L2
@@ -544,7 +555,15 @@ static int _recv(netdev_t *netdev, void *buf, size_t len, void *info)
 
     mutex_lock(&dev->dev_lock);
 
-    uint8_t size = dev->rx_pkt.len;
+    uint16_t size = ringbuffer_empty(&dev->rx_buf)
+        ? 0
+        : (ringbuffer_peek_one(&dev->rx_buf) + ESP_NOW_ADDR_LEN);
+
+    if (size && dev->rx_buf.avail < size) {
+        /* this should never happen unless this very function messes up */
+        mutex_unlock(&dev->dev_lock);
+        return -EIO;
+    }
 
     if (!buf && !len) {
         /* return the size without dropping received data */
@@ -554,38 +573,39 @@ static int _recv(netdev_t *netdev, void *buf, size_t len, void *info)
 
     if (!buf && len) {
         /* return the size and drop received data */
-        dev->rx_pkt.len = 0;
+        if (size)
+            ringbuffer_remove(&dev->rx_buf, 1 + size);
         mutex_unlock(&dev->dev_lock);
         return size;
     }
 
-    if (buf && len && !dev->rx_pkt.len) {
+    if (buf && len && !size) {
         mutex_unlock(&dev->dev_lock);
         return 0;
     }
 
-    if (buf && len && dev->rx_pkt.len) {
-        if (dev->rx_pkt.len > len) {
+    if (buf && len && size) {
+        if (size > len) {
             DEBUG("[esp_now] No space in receive buffers\n");
             mutex_unlock(&dev->dev_lock);
             return -ENOBUFS;
         }
 
+        /* remove already peeked size byte */
+        ringbuffer_remove(&dev->rx_buf, 1);
+        ringbuffer_get(&dev->rx_buf, buf, size);
+
+        uint8_t *mac = buf;
+
         DEBUG("%s: received %d byte from %02x:%02x:%02x:%02x:%02x:%02x\n",
-              __func__, dev->rx_pkt.len,
-              dev->rx_pkt.mac[0], dev->rx_pkt.mac[1], dev->rx_pkt.mac[2],
-              dev->rx_pkt.mac[3], dev->rx_pkt.mac[4], dev->rx_pkt.mac[5]);
+              __func__, size - ESP_NOW_ADDR_LEN,
+              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 #if defined(MODULE_OD) && ENABLE_DEBUG
-        od_hex_dump(dev->rx_pkt.buf.data, dev->rx_pkt.len, OD_WIDTH_DEFAULT);
+        od_hex_dump(buf + ESP_NOW_ADDR_LEN, size - ESP_NOW_ADDR_LEN, OD_WIDTH_DEFAULT);
 #endif
 
-        if (esp_now_is_peer_exist(dev->rx_pkt.mac) <= 0) {
-            _esp_now_add_peer(dev->rx_pkt.mac, esp_now_params.channel, esp_now_params.key);
-        }
-
-        if (buf != &dev->rx_pkt) {
-            memcpy(buf, &dev->rx_pkt, dev->rx_pkt.len);
-            dev->rx_pkt.len = 0;
+        if (esp_now_is_peer_exist(mac) <= 0) {
+            _esp_now_add_peer(mac, esp_now_params.channel, esp_now_params.key);
         }
 
 #ifdef MODULE_NETSTATS_L2
