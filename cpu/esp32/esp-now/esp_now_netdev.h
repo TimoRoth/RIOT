@@ -79,8 +79,8 @@ typedef struct
 
     uint8_t addr[ESP_NOW_ADDR_LEN];  /**< device addr (MAC address) */
 
-    uint8_t rx_mem[ESP_NOW_BUFSIZE];
-    ringbuffer_t rx_buf;
+    uint8_t rx_mem[ESP_NOW_BUFSIZE]; /**< memory holding incoming packages */
+    ringbuffer_t rx_buf;             /**< ringbuffer for incoming packages */
 
     gnrc_netif_t* netif;             /**< reference to the corresponding netif */
 
