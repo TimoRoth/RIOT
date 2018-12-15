@@ -34,6 +34,7 @@
 static int _send(gnrc_netif_t *netif, gnrc_pktsnip_t *pkt)
 {
     uint8_t mac[ESP_NOW_ADDR_LEN];
+    uint8_t plbuf[ESP_NOW_MAX_SIZE_RAW];
     netdev_t *dev = netif->dev;
 
     assert(pkt != NULL);
@@ -64,7 +65,7 @@ static int _send(gnrc_netif_t *netif, gnrc_pktsnip_t *pkt)
     }
 
     iolist_t payload_iolist = {
-        .iol_base = calloc(1, sizeof(esp_now_pkt_hdr_t)),
+        .iol_base = plbuf,
         .iol_len = sizeof(esp_now_pkt_hdr_t)
     };
 
@@ -76,12 +77,6 @@ static int _send(gnrc_netif_t *netif, gnrc_pktsnip_t *pkt)
 
     esp_now_pkt_hdr_t *esp_hdr = payload_iolist.iol_base;
 
-    if (!esp_hdr) {
-        DEBUG("gnrc_esp_now: no memory to allocate payload buffer\n");
-        gnrc_pktbuf_release(pkt);
-        return -ENOMEM;
-    }
-
     switch (payload->type) {
 #ifdef MODULE_GNRC_SIXLOWPAN
         case GNRC_NETTYPE_SIXLOWPAN:
@@ -92,27 +87,18 @@ static int _send(gnrc_netif_t *netif, gnrc_pktsnip_t *pkt)
             esp_hdr->flags = 0;
     }
 
+    uint8_t *pos = payload_iolist.iol_base + payload_iolist.iol_len;
+
     while (payload) {
-        if (payload_iolist.iol_len + payload->size > ESP_NOW_MAX_SIZE) {
+        if (payload_iolist.iol_len + payload->size > sizeof(plbuf)) {
             DEBUG("gnrc_esp_now: payload length exceeds maximum(%u>%u)\n",
-                  payload_iolist.iol_len, ESP_NOW_MAX_SIZE);
-            free(payload_iolist.iol_base);
+                  payload_iolist.iol_len + payload->size, sizeof(plbuf));
             gnrc_pktbuf_release(pkt);
             return -EBADMSG;
         }
 
-        payload_iolist.iol_base = realloc(payload_iolist.iol_base,
-                                          payload_iolist.iol_len + payload->size);
-        if (!payload_iolist.iol_base) {
-            DEBUG("gnrc_esp_now: no memory to reallocate payload buffer\n");
-            free(esp_hdr);
-            gnrc_pktbuf_release(pkt);
-            return -ENOMEM;
-        }
-        esp_hdr = payload_iolist.iol_base;
-
-        memcpy(payload_iolist.iol_base + payload_iolist.iol_len,
-               payload->data, payload->size);
+        memcpy(pos, payload->data, payload->size);
+        pos += payload->size;
         payload_iolist.iol_len += payload->size;
 
         payload = payload->next;
@@ -124,11 +110,7 @@ static int _send(gnrc_netif_t *netif, gnrc_pktsnip_t *pkt)
     DEBUG("gnrc_esp_now: sending packet to %02x:%02x:%02x:%02x:%02x:%02x with size %u\n",
           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], (unsigned)payload_iolist.iol_len);
 
-    int res = dev->driver->send(dev, &iolist);
-
-    free(payload_iolist.iol_base);
-
-    return res;
+    return dev->driver->send(dev, &iolist);
 }
 
 static gnrc_pktsnip_t *_recv(gnrc_netif_t *netif)

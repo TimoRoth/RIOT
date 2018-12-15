@@ -214,12 +214,17 @@ static IRAM_ATTR void esp_now_recv_cb(const uint8_t *mac, const uint8_t *data, i
     }
 #endif
 
-    critical_enter();
     mutex_lock(&_esp_now_dev.dev_lock);
+    critical_enter();
 
+    /*
+     * The ring buffer uses a single byte for the pkt length, followed by the mac address,
+     * followed by the actual packet data. The MTU for ESP-NOW is 250 bytes, so len will never
+     * exceed the limits of a byte as the mac address length is not included.
+     */
     if ((int)ringbuffer_get_free(&_esp_now_dev.rx_buf) < 1 + ESP_NOW_ADDR_LEN + len) {
-        mutex_unlock(&_esp_now_dev.dev_lock);
         critical_exit();
+        mutex_unlock(&_esp_now_dev.dev_lock);
         DEBUG("%s: buffer full, dropping incoming packet of %d bytes\n", __func__, len);
         return;
     }
@@ -236,13 +241,12 @@ static IRAM_ATTR void esp_now_recv_cb(const uint8_t *mac, const uint8_t *data, i
     ringbuffer_add(&_esp_now_dev.rx_buf, (char*)mac, ESP_NOW_ADDR_LEN);
     ringbuffer_add(&_esp_now_dev.rx_buf, (char*)data, len);
 
-    mutex_unlock(&_esp_now_dev.dev_lock);
-
     if (_esp_now_dev.netdev.event_callback) {
         _esp_now_dev.netdev.event_callback((netdev_t*)&_esp_now_dev, NETDEV_EVENT_ISR);
     }
 
     critical_exit();
+    mutex_unlock(&_esp_now_dev.dev_lock);
 }
 
 static int _esp_now_sending = 0;
