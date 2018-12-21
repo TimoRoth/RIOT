@@ -512,7 +512,7 @@ static int _send(netdev_t *netdev, const iolist_t *iolist)
     iolist = iolist->iol_next;
 
     DEBUG("%s: send %u byte\n", __func__, (unsigned)iolist->iol_len);
-#if defined(MODULE_OD) && ENABLE_DEBUG
+#if MODULE_OD && ENABLE_DEBUG
     od_hex_dump(iolist->iol_base, iolist->iol_len, OD_WIDTH_DEFAULT);
 #endif
 
@@ -614,7 +614,7 @@ static int _recv(netdev_t *netdev, void *buf, size_t len, void *info)
         DEBUG("%s: received %d byte from %02x:%02x:%02x:%02x:%02x:%02x\n",
               __func__, size - ESP_NOW_ADDR_LEN,
               mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-#if defined(MODULE_OD) && ENABLE_DEBUG
+#if MODULE_OD && ENABLE_DEBUG
         od_hex_dump(buf + ESP_NOW_ADDR_LEN, size - ESP_NOW_ADDR_LEN, OD_WIDTH_DEFAULT);
 #endif
 
