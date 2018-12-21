@@ -240,8 +240,8 @@ void auto_init_esp_now(void)
         LOG_ERROR("[auto_init_netif] error initializing esp_now\n");
     } else {
         esp_now_dev->netif =
-            gnrc_netif_esp_now_create(_esp_now_stack,
-                                      ESP_NOW_STACKSIZE, ESP_NOW_PRIO,
+            gnrc_netif_esp_now_create(_esp_now_stack, sizeof(_esp_now_stack),
+                                      ESP_NOW_PRIO,
                                       "net-esp-now",
                                       &esp_now_dev->netdev);
     }
