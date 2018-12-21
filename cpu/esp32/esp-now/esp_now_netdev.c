@@ -174,31 +174,16 @@ static void esp_now_scan_peers_start(void)
     esp_wifi_scan_start(&scan_cfg, false);
 }
 
-#define ESP_NOW_EVENT_SCAN_PEERS 1
-
-static kernel_pid_t esp_now_event_handler_pid;
-char esp_now_event_handler_stack [THREAD_STACKSIZE_DEFAULT];
-
-static void *esp_now_event_handler(void *arg)
-{
-    msg_t event;
-    while (1) {
-        msg_receive(&event);
-        switch (event.content.value) {
-            case ESP_NOW_EVENT_SCAN_PEERS:
-                esp_now_scan_peers_start();
-                break;
-        }
-    }
-    return NULL;
-}
-
 static void IRAM_ATTR esp_now_scan_peers_timer_cb(void* arg)
 {
     DEBUG("%s\n", __func__);
 
-    static msg_t event = { .content = { .value = ESP_NOW_EVENT_SCAN_PEERS } };
-    msg_send(&event, esp_now_event_handler_pid);
+    esp_now_netdev_t* dev = (esp_now_netdev_t*)arg;
+    
+    if (dev->netdev.event_callback) {
+        dev->scan_event = true;
+        dev->netdev.event_callback((netdev_t*)dev, NETDEV_EVENT_ISR);
+    }
 }
 
 #else
@@ -244,6 +229,7 @@ static IRAM_ATTR void esp_now_recv_cb(const uint8_t *mac, const uint8_t *data, i
     ringbuffer_add(&_esp_now_dev.rx_buf, (char*)data, len);
 
     if (_esp_now_dev.netdev.event_callback) {
+        _esp_now_dev.recv_event = true;
         _esp_now_dev.netdev.event_callback((netdev_t*)&_esp_now_dev, NETDEV_EVENT_ISR);
     }
 
@@ -447,15 +433,6 @@ esp_now_netdev_t *netdev_esp_now_setup(void)
     esp_now_register_recv_cb(esp_now_recv_cb);
 
 #if ESP_NOW_UNICAST
-    /* create the ESP_NOW event handler thread */
-    esp_now_event_handler_pid = thread_create(esp_now_event_handler_stack,
-                                             sizeof(esp_now_event_handler_stack),
-                                             ESP_NOW_PRIO + 1,
-                                             THREAD_CREATE_WOUT_YIELD |
-                                             THREAD_CREATE_STACKTEST,
-                                             esp_now_event_handler,
-                                             NULL, "net-esp-now-event");
-
     /* timer for peer scan initialization */
     _esp_now_scan_peers_done = false;
     _esp_now_scan_peers_timer.callback = &esp_now_scan_peers_timer_cb;
@@ -764,7 +741,15 @@ static void _isr(netdev_t *netdev)
     CHECK_PARAM(netdev != NULL);
 
     esp_now_netdev_t *dev = (esp_now_netdev_t*)netdev;
-    dev->netdev.event_callback(netdev, NETDEV_EVENT_RX_COMPLETE);
+
+    if (dev->recv_event) {
+        dev->recv_event = false;
+        dev->netdev.event_callback(netdev, NETDEV_EVENT_RX_COMPLETE);
+    }
+    else if (dev->scan_event) {
+        dev->scan_event = false;
+        esp_now_scan_peers_start();
+    }
     return;
 }
 
