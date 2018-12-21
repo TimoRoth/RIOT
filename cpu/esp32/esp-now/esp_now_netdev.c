@@ -17,8 +17,6 @@
  * @author      Timo Rothenpieler <timo.rothenpieler@uni-bremen.de>
  */
 
-#define ENABLE_DEBUG (0)
-#include "debug.h"
 #include "log.h"
 #include "tools.h"
 
@@ -43,10 +41,13 @@
 #include "esp_now_params.h"
 #include "esp_now_netdev.h"
 
-#define ESP_NOW_UNICAST          1
+#define ENABLE_DEBUG (0)
+#include "debug.h"
 
-#define ESP_NOW_WIFI_STA         1
-#define ESP_NOW_WIFI_SOFTAP      2
+#define ESP_NOW_UNICAST          (1)
+
+#define ESP_NOW_WIFI_STA         (1)
+#define ESP_NOW_WIFI_SOFTAP      (2)
 #define ESP_NOW_WIFI_STA_SOFTAP  (ESP_NOW_WIFI_STA + ESP_NOW_WIFI_SOFTAP)
 
 #define ESP_NOW_AP_PREFIX        "RIOT_ESP_"
