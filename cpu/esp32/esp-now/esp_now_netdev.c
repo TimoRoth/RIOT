@@ -94,6 +94,16 @@ static bool _esp_now_add_peer(uint8_t* bssid, uint8_t channel, uint8_t* key)
 static wifi_ap_record_t* aps = NULL;
 static uint32_t aps_size = 0;
 
+static const wifi_scan_config_t scan_cfg = {
+        .ssid = NULL,
+        .bssid = NULL,
+        .channel = ESP_NOW_CHANNEL,
+        .show_hidden = true,
+        .scan_type = WIFI_SCAN_TYPE_ACTIVE,
+        .scan_time.active.min = 0,
+        .scan_time.active.max = 120 /* TODO tune value */
+};
+
 static void IRAM_ATTR esp_now_scan_peers_done(void)
 {
     mutex_lock(&_esp_now_dev.dev_lock);
@@ -158,16 +168,6 @@ static void IRAM_ATTR esp_now_scan_peers_done(void)
 static void esp_now_scan_peers_start(void)
 {
     DEBUG("%s\n", __func__);
-
-    wifi_scan_config_t scan_cfg = {
-        .ssid = NULL,
-        .bssid = NULL,
-        .channel = esp_now_params.channel,
-        .show_hidden = true,
-        .scan_type = WIFI_SCAN_TYPE_ACTIVE,
-        .scan_time.active.min = 0,
-        .scan_time.active.max = 120 /* TODO tune value */
-    };
 
     esp_wifi_scan_start(&scan_cfg, false);
 }
