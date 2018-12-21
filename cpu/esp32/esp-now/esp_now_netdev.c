@@ -431,8 +431,9 @@ esp_now_netdev_t *netdev_esp_now_setup(void)
     dev->netdev.driver = &_esp_now_driver;
 
     /* initialize netdev data structure */
-    dev->peers_all = 0;
-    dev->peers_enc = 0;
+    dev->recv_event = false;
+    dev->scan_event = false;
+
     mutex_init(&dev->dev_lock);
 
     /* initialize ESP-NOW and register callback functions */
