@@ -88,10 +88,10 @@ typedef struct
     gnrc_nettype_t proto;            /**< protocol for upper layer */
 #endif
 
-    uint8_t peers_all;               /**< number of peers reachable */
-    uint8_t peers_enc;               /**< number of encrypted peers */
-
     mutex_t dev_lock;                /**< device is already in use */
+
+    bool recv_event;                 /**< ESP-NOW frame received */
+    bool scan_event;                 /**< ESP-NOW peers have to be scannged */
 
 } esp_now_netdev_t;
 
