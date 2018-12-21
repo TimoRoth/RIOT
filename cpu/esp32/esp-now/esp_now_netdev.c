@@ -62,11 +62,7 @@
 static esp_now_netdev_t _esp_now_dev = { 0 };
 static const netdev_driver_t _esp_now_driver;
 
-#if ESP_NOW_UNICAST
-static xtimer_t _esp_now_scan_peers_timer;
-static bool _esp_now_scan_peers_done = false;
-
-static bool _esp_now_add_peer(uint8_t* bssid, uint8_t channel, uint8_t* key)
+static bool _esp_now_add_peer(const uint8_t* bssid, uint8_t channel, uint8_t* key)
 {
     if (esp_now_is_peer_exist(bssid)) {
         return false;
@@ -89,6 +85,11 @@ static bool _esp_now_add_peer(uint8_t* bssid, uint8_t channel, uint8_t* key)
           bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5], ret);
     return (ret == ESP_OK);
 }
+
+#if ESP_NOW_UNICAST
+
+static xtimer_t _esp_now_scan_peers_timer;
+static bool _esp_now_scan_peers_done = false;
 
 #define ESP_NOW_APS_BLOCK_SIZE 8 /* has to be power of two */
 
@@ -274,7 +275,9 @@ static esp_err_t IRAM_ATTR _esp_system_event_handler(void *ctx, system_event_t *
             break;
         case SYSTEM_EVENT_SCAN_DONE:
             DEBUG("%s WiFi scan done\n", __func__);
+#if ESP_NOW_UNICAST
             esp_now_scan_peers_done();
+#endif
             break;
         default:
             break;
@@ -419,9 +422,9 @@ esp_now_netdev_t *netdev_esp_now_setup(void)
         return NULL;
     }
 
-#if ESP_NOW_UNICAST==0 /* TODO */
+#if !ESP_NOW_UNICAST
     /* all ESP-NOW nodes get the shared mac address on their station interface */
-    wifi_set_macaddr(STATION_IF, (uint8_t*)_esp_now_mac);
+    esp_wifi_set_mac(ESP_IF_WIFI_STA, (uint8_t*)_esp_now_mac);
 #endif
 
     /* set the netdev driver */
@@ -461,11 +464,9 @@ esp_now_netdev_t *netdev_esp_now_setup(void)
     esp_now_scan_peers_done();
 
 #else /* ESP_NOW_UNICAST */
-#if 0
-    int res = esp_now_add_peer((uint8_t*)_esp_now_mac, ESP_NOW_ROLE_COMBO,
-                               esp_now_params.channel, NULL, 0);
-    DEBUG("%s: multicast node added %d\n", __func__, res);
-#endif
+    bool res = _esp_now_add_peer(_esp_now_mac, esp_now_params.channel,
+                                               esp_now_params.key);
+    DEBUG("%s: multicast node add %s\n", __func__, res ? "success" : "error");
 #endif /* ESP_NOW_UNICAST */
 
     return dev;
@@ -500,7 +501,8 @@ static int _send(netdev_t *netdev, const iolist_t *iolist)
 
     mutex_lock(&dev->dev_lock);
 
-    uint8_t* _esp_now_dst = NULL;
+#if ESP_NOW_UNICAST
+   uint8_t* _esp_now_dst = NULL;
 
     for (uint8_t i = 0; i < ESP_NOW_ADDR_LEN; i++) {
         if (((uint8_t*)iolist->iol_base)[i] != 0xff) {
@@ -508,7 +510,9 @@ static int _send(netdev_t *netdev, const iolist_t *iolist)
             break;
         }
     }
-
+#else
+   const uint8_t* _esp_now_dst = _esp_now_mac;
+#endif
     iolist = iolist->iol_next;
 
     DEBUG("%s: send %u byte\n", __func__, (unsigned)iolist->iol_len);
@@ -618,9 +622,11 @@ static int _recv(netdev_t *netdev, void *buf, size_t len, void *info)
         od_hex_dump(buf + ESP_NOW_ADDR_LEN, size - ESP_NOW_ADDR_LEN, OD_WIDTH_DEFAULT);
 #endif
 
+#if ESP_NOW_UNICAST
         if (esp_now_is_peer_exist(mac) <= 0) {
             _esp_now_add_peer(mac, esp_now_params.channel, esp_now_params.key);
         }
+#endif
 
 #ifdef MODULE_NETSTATS_L2
         netdev->stats.rx_count++;
