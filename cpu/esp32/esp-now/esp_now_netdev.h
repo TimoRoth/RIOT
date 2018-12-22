@@ -89,6 +89,7 @@ typedef struct
 #endif
 
     mutex_t dev_lock;                /**< device is already in use */
+    mutex_t rx_lock;                 /**< rx_buf handling in progress */
 
     bool recv_event;                 /**< ESP-NOW frame received */
     bool scan_event;                 /**< ESP-NOW peers have to be scannged */

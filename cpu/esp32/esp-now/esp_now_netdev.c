@@ -201,6 +201,7 @@ static IRAM_ATTR void esp_now_recv_cb(const uint8_t *mac, const uint8_t *data, i
     }
 #endif
 
+    mutex_lock(&_esp_now_dev.rx_lock);
     critical_enter();
 
     /*
@@ -210,6 +211,7 @@ static IRAM_ATTR void esp_now_recv_cb(const uint8_t *mac, const uint8_t *data, i
      */
     if ((int)ringbuffer_get_free(&_esp_now_dev.rx_buf) < 1 + ESP_NOW_ADDR_LEN + len) {
         critical_exit();
+        mutex_unlock(&_esp_now_dev.rx_lock);
         DEBUG("%s: buffer full, dropping incoming packet of %d bytes\n", __func__, len);
         return;
     }
@@ -232,6 +234,7 @@ static IRAM_ATTR void esp_now_recv_cb(const uint8_t *mac, const uint8_t *data, i
     }
 
     critical_exit();
+    mutex_unlock(&_esp_now_dev.rx_lock);
 }
 
 static int _esp_now_sending = 0;
@@ -418,6 +421,7 @@ esp_now_netdev_t *netdev_esp_now_setup(void)
     dev->scan_event = false;
 
     mutex_init(&dev->dev_lock);
+    mutex_init(&dev->rx_lock);
 
     /* initialize ESP-NOW and register callback functions */
     result = esp_now_init();
@@ -538,7 +542,7 @@ static int _recv(netdev_t *netdev, void *buf, size_t len, void *info)
 
     esp_now_netdev_t* dev = (esp_now_netdev_t*)netdev;
 
-    mutex_lock(&dev->dev_lock);
+    mutex_lock(&dev->rx_lock);
 
     uint16_t size = ringbuffer_empty(&dev->rx_buf)
         ? 0
@@ -546,13 +550,13 @@ static int _recv(netdev_t *netdev, void *buf, size_t len, void *info)
 
     if (size && dev->rx_buf.avail < size) {
         /* this should never happen unless this very function messes up */
-        mutex_unlock(&dev->dev_lock);
+        mutex_unlock(&dev->rx_lock);
         return -EIO;
     }
 
     if (!buf && !len) {
         /* return the size without dropping received data */
-        mutex_unlock(&dev->dev_lock);
+        mutex_unlock(&dev->rx_lock);
         return size;
     }
 
@@ -560,19 +564,19 @@ static int _recv(netdev_t *netdev, void *buf, size_t len, void *info)
         /* return the size and drop received data */
         if (size)
             ringbuffer_remove(&dev->rx_buf, 1 + size);
-        mutex_unlock(&dev->dev_lock);
+        mutex_unlock(&dev->rx_lock);
         return size;
     }
 
     if (buf && len && !size) {
-        mutex_unlock(&dev->dev_lock);
+        mutex_unlock(&dev->rx_lock);
         return 0;
     }
 
     if (buf && len && size) {
         if (size > len) {
             DEBUG("[esp_now] No space in receive buffers\n");
-            mutex_unlock(&dev->dev_lock);
+            mutex_unlock(&dev->rx_lock);
             return -ENOBUFS;
         }
 
@@ -600,11 +604,11 @@ static int _recv(netdev_t *netdev, void *buf, size_t len, void *info)
         netdev->stats.rx_bytes += size;
 #endif
 
-        mutex_unlock(&dev->dev_lock);
+        mutex_unlock(&dev->rx_lock);
         return size;
     }
 
-    mutex_unlock(&dev->dev_lock);
+    mutex_unlock(&dev->rx_lock);
     return -EINVAL;
 }
 
