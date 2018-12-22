@@ -41,7 +41,7 @@
 #include "esp_now_params.h"
 #include "esp_now_netdev.h"
 
-#define ENABLE_DEBUG (0)
+#define ENABLE_DEBUG             (0)
 #include "debug.h"
 
 #define ESP_NOW_UNICAST          (1)
@@ -142,9 +142,8 @@ static void IRAM_ATTR esp_now_scan_peers_done(void)
         /* iterate over APs records */
         for (uint16_t i = 0; i < ap_num; i++) {
 
-            /* check whether the AP is an ESP_NOW node which is not already a peer */
-            if (strncmp((char*)aps[i].ssid, ESP_NOW_AP_PREFIX, ESP_NOW_AP_PREFIX_LEN) == 0 &&
-                !esp_now_is_peer_exist(aps[i].bssid)) {
+            /* check whether the AP is an ESP_NOW node */
+            if (strncmp((char*)aps[i].ssid, ESP_NOW_AP_PREFIX, ESP_NOW_AP_PREFIX_LEN) == 0) {
                 /* add the AP as peer */
                 _esp_now_add_peer(aps[i].bssid, aps[i].primary, esp_now_params.key);
             }
@@ -440,7 +439,7 @@ esp_now_netdev_t *netdev_esp_now_setup(void)
     _esp_now_scan_peers_timer.arg = dev;
 
     /* execute the first scan */
-    esp_now_scan_peers_done();
+    esp_now_scan_peers_start();
 
 #else /* ESP_NOW_UNICAST */
     bool res = _esp_now_add_peer(_esp_now_mac, esp_now_params.channel,
