@@ -201,7 +201,6 @@ static IRAM_ATTR void esp_now_recv_cb(const uint8_t *mac, const uint8_t *data, i
     }
 #endif
 
-    mutex_lock(&_esp_now_dev.dev_lock);
     critical_enter();
 
     /*
@@ -211,7 +210,6 @@ static IRAM_ATTR void esp_now_recv_cb(const uint8_t *mac, const uint8_t *data, i
      */
     if ((int)ringbuffer_get_free(&_esp_now_dev.rx_buf) < 1 + ESP_NOW_ADDR_LEN + len) {
         critical_exit();
-        mutex_unlock(&_esp_now_dev.dev_lock);
         DEBUG("%s: buffer full, dropping incoming packet of %d bytes\n", __func__, len);
         return;
     }
@@ -234,7 +232,6 @@ static IRAM_ATTR void esp_now_recv_cb(const uint8_t *mac, const uint8_t *data, i
     }
 
     critical_exit();
-    mutex_unlock(&_esp_now_dev.dev_lock);
 }
 
 static int _esp_now_sending = 0;
