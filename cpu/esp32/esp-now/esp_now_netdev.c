@@ -520,7 +520,6 @@ static int _send(netdev_t *netdev, const iolist_t *iolist)
         netdev->event_callback(netdev, NETDEV_EVENT_TX_COMPLETE);
 #endif
 
-printf("D");
         mutex_unlock(&dev->dev_lock);
         return iolist->iol_len;
     }
