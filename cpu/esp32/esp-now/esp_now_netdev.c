@@ -507,24 +507,16 @@ static int _send(netdev_t *netdev, const iolist_t *iolist)
 
     /* send the packet to the peer(s) mac address */
     if (esp_now_send(_esp_now_dst, iolist->iol_base, iolist->iol_len) == 0) {
-        /**
-         * The function esp_now_send_cb does seems sporadically not to be
-         * called and _esp_now_sending remains set. This locks the entire
-         * netdev driver. The netdev driver also works without the feedback
-         * of the transmission success. In the case of a lost message, it
-         * can rely on the error control of the upper classes.
-         */
-#if 0
         while (_esp_now_sending > 0) {
             thread_yield_higher();
         }
-#endif
 
 #ifdef MODULE_NETSTATS_L2
         netdev->stats.tx_bytes += iolist->iol_len;
         netdev->event_callback(netdev, NETDEV_EVENT_TX_COMPLETE);
 #endif
 
+printf("D");
         mutex_unlock(&dev->dev_lock);
         return iolist->iol_len;
     }
