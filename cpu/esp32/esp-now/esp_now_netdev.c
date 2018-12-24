@@ -498,8 +498,6 @@ static int _send(netdev_t *netdev, const iolist_t *iolist)
     od_hex_dump(iolist->iol_base, iolist->iol_len, OD_WIDTH_DEFAULT);
 #endif
 
-    _esp_now_sending = 1;
-
     if (_esp_now_dst) {
         DEBUG("%s: send to esp_now addr %02x:%02x:%02x:%02x:%02x:%02x\n", __func__,
               _esp_now_dst[0], _esp_now_dst[1], _esp_now_dst[2],
@@ -510,6 +508,7 @@ static int _send(netdev_t *netdev, const iolist_t *iolist)
 
     /* send the packet to the peer(s) mac address */
     if (esp_now_send(_esp_now_dst, iolist->iol_base, iolist->iol_len) == 0) {
+        _esp_now_sending = 1;
         while (_esp_now_sending > 0) {
             thread_yield_higher();
         }
